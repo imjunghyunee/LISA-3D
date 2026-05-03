@@ -1,0 +1,18 @@
+# Extra packages for LISA-3D beyond the 'lisa' conda environment.
+# Install with:
+#   conda run -n lisa pip install -r requirements_extra.txt
+
+# Training logging
+tensorboard>=2.11.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# NOTE: open3d is intentionally excluded.
+# The evaluation script (graspclutter6dAPI/utils/eval_seg_3d_iou.py) uses
+# open3d only for GT construction from mesh models (not needed for prediction).
+# LISA-3D's lifting module writes PLY files using plain numpy/string formatting.
+#
+# To install open3d for visualisation:
+#   conda run -n lisa pip install open3d
+# (requires torch >= 1.13, Python 3.7-3.10 — compatible with the lisa env)
