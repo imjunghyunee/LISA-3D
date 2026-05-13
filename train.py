@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume",            default="",    type=str)
     p.add_argument("--print_freq",        default=50,    type=int)
     p.add_argument("--save_freq",         default=1,     type=int)
+    p.add_argument("--save_steps",        default=0,     type=int,
+                   help="If >0, save an intra-epoch checkpoint every N "
+                        "optimizer steps to <output_dir>/lora_<mode>_step_"
+                        "latest.pth (atomic rename). 0 = epoch-boundary "
+                        "saves only (legacy behaviour).")
     p.add_argument("--vision_tower",
                    default="openai/clip-vit-large-patch14")
     p.add_argument("--conv_type",         default="llava_v1")
@@ -399,13 +404,25 @@ def train_one_epoch(
     device: torch.device,
     global_step: int,
     is_rank0: bool,
+    world_size: int = 1,
     loss_logger: Optional["LossLogger"] = None,
+    start_step: int = 0,
 ) -> Tuple[int, dict]:
+    """Train for one epoch.
+
+    Args:
+        start_step: Number of batches to skip at the start of this epoch
+                    (used for mid-epoch resume).  Pre-skip batches are still
+                    pulled from the DataLoader workers (so DistributedSampler's
+                    deterministic shuffle order advances correctly) but are
+                    discarded without forward/backward.
+    """
     model.train()
     total_loss   = 0.0
     total_seg_a  = 0.0
     total_seg_b  = 0.0
     total_geo    = 0.0
+    n_steps_done = 0   # count of un-skipped batches (for running averages)
     optimizer.zero_grad()
 
     float_dtype = {
@@ -414,7 +431,15 @@ def train_one_epoch(
         "fp32": torch.float32,
     }[args.precision]
 
+    if start_step > 0 and is_rank0:
+        print(f"[resume] epoch {epoch}: skipping first {start_step} batches "
+              f"to reach saved position.")
+
     for step, batch in enumerate(loader):
+        # Mid-epoch resume: discard batches we already trained on.
+        if step < start_step:
+            continue
+
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = _move_tensor(v, device, float_dtype)
@@ -460,6 +485,7 @@ def train_one_epoch(
         total_seg_a += seg_a_v
         total_seg_b += seg_b_v
         total_geo   += geo_v
+        n_steps_done += 1
 
         if is_rank0 and loss_logger is not None:
             loss_logger.log_step(
@@ -483,8 +509,30 @@ def train_one_epoch(
             optimizer.zero_grad()
             global_step += 1
 
+            # Intra-epoch step checkpoint.  Save at a clean boundary —
+            # gradients zeroed, optimizer/scheduler advanced — so resume
+            # observes the same state we observed here.  Rank-0 writes;
+            # all ranks wait at a barrier so they don't race ahead while
+            # disk IO is in flight.
+            if (args.save_steps > 0
+                    and global_step % args.save_steps == 0):
+                if is_rank0:
+                    ckpt_path = os.path.join(
+                        args.output_dir,
+                        f"lora_{args.unfreeze_mode}_step_latest.pth",
+                    )
+                    save_lora_checkpoint(
+                        raw_model, optimizer, epoch, ckpt_path,
+                        scheduler=scheduler,
+                        step_in_epoch=step + 1,
+                        global_step=global_step,
+                        atomic=True,
+                    )
+                if world_size > 1:
+                    dist.barrier()
+
         if is_rank0 and (step + 1) % args.print_freq == 0:
-            n = step + 1
+            n = max(1, n_steps_done)
             print(
                 f"Epoch [{epoch}/{args.epochs}] Step [{step+1}/{len(loader)}] "
                 f"loss={total_loss/n:.4f}  "
@@ -501,7 +549,7 @@ def train_one_epoch(
                 writer.add_scalar("train/lr",
                                   scheduler.get_last_lr()[0], global_step)
 
-    n_steps = max(1, len(loader))
+    n_steps = max(1, n_steps_done)
     epoch_avg = {
         "num_steps": n_steps,
         "loss":  total_loss  / n_steps,
@@ -869,9 +917,26 @@ def main() -> None:
     )
 
     # ── Resume ────────────────────────────────────────────────────────────
+    # ``load_lora_checkpoint`` returns {epoch, step_in_epoch, global_step}.
+    # step_in_epoch > 0 ⇒ mid-epoch save: re-enter that epoch and skip the
+    # first step_in_epoch batches.  step_in_epoch == 0 ⇒ epoch-boundary
+    # save (legacy or end-of-epoch): start the NEXT epoch fresh.
     start_epoch = 0
+    start_step_in_epoch = 0
+    resumed_global_step = 0
     if args.resume:
-        start_epoch = load_lora_checkpoint(raw_model, optimizer, args.resume)
+        state = load_lora_checkpoint(
+            raw_model, optimizer, args.resume, scheduler=scheduler,
+        )
+        if state["step_in_epoch"] > 0:
+            # Re-enter the in-progress epoch.  The loop is `for epoch in
+            # range(start_epoch + 1, ...)`, so set start_epoch one below
+            # the saved epoch so the first iteration uses state["epoch"].
+            start_epoch = state["epoch"] - 1
+            start_step_in_epoch = state["step_in_epoch"]
+        else:
+            start_epoch = state["epoch"]
+        resumed_global_step = state["global_step"]
 
     # ── Training loop ─────────────────────────────────────────────────────
     # Sweep bookkeeping (None in standalone runs without val_loader).
@@ -883,15 +948,26 @@ def main() -> None:
     sweep_mode = bool(args.val_scene_ids_path or args.trial_id
                       or args.prune_sentinel)
 
-    global_step = start_epoch * steps_per_epoch
+    # Prefer the resumed counter when available; fall back to the legacy
+    # epoch-derived estimate for old epoch-only checkpoints.
+    global_step = (resumed_global_step
+                   if resumed_global_step > 0
+                   else start_epoch * steps_per_epoch)
+
+    first_epoch_after_resume = True
     for epoch in range(start_epoch + 1, args.epochs + 1):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
 
+        skip_n = start_step_in_epoch if first_epoch_after_resume else 0
+        first_epoch_after_resume = False
+
         global_step, epoch_avg = train_one_epoch(
             model, raw_model, train_loader, optimizer, scheduler,
             writer, args, epoch, device, global_step, is_rank0,
+            world_size=world_size,
             loss_logger=loss_logger,
+            start_step=skip_n,
         )
         last_train_loss = epoch_avg["loss"]
 
@@ -934,7 +1010,12 @@ def main() -> None:
                 args.output_dir,
                 f"lora_{args.unfreeze_mode}_epoch{epoch:03d}.pth",
             )
-            save_lora_checkpoint(raw_model, optimizer, epoch, ckpt_path)
+            save_lora_checkpoint(
+                raw_model, optimizer, epoch, ckpt_path,
+                scheduler=scheduler,
+                step_in_epoch=0,        # epoch boundary: resume next epoch
+                global_step=global_step,
+            )
 
         # Sweep prune signal (rank-0 reads sentinel, broadcasts to others).
         if _check_prune_sentinel(args, device, world_size, is_rank0):
@@ -957,6 +1038,9 @@ def main() -> None:
                 raw_model, optimizer, args.epochs,
                 os.path.join(args.output_dir,
                              f"lora_{args.unfreeze_mode}_final.pth"),
+                scheduler=scheduler,
+                step_in_epoch=0,
+                global_step=global_step,
             )
         if writer is not None:
             writer.close()

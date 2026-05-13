@@ -37,6 +37,7 @@ CAMERA="realsense-d415"
 WORKERS="4"
 PRINT_FREQ="50"
 SAVE_FREQ="1"
+SAVE_STEPS="0"
 RESUME=""
 VISION_TOWER="openai/clip-vit-large-patch14"
 TARGET_NAMES=""
@@ -65,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --workers)           WORKERS="$2";           shift 2 ;;
         --print_freq)        PRINT_FREQ="$2";        shift 2 ;;
         --save_freq)         SAVE_FREQ="$2";         shift 2 ;;
+        --save_steps)        SAVE_STEPS="$2";        shift 2 ;;
         --resume)            RESUME="$2";            shift 2 ;;
         --vision_tower)      VISION_TOWER="$2";      shift 2 ;;
         --target_names)      TARGET_NAMES="$2";      shift 2 ;;
@@ -174,5 +176,6 @@ $TORCHRUN \
     --workers           "$WORKERS" \
     --print_freq        "$PRINT_FREQ" \
     --save_freq         "$SAVE_FREQ" \
+    --save_steps        "$SAVE_STEPS" \
     --vision_tower      "$VISION_TOWER" \
     $EXTRA_ARGS
