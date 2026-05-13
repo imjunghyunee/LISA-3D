@@ -133,27 +133,98 @@ def inject_lora(
     return model
 
 
+# Substrings that identify trainable segmentation-head parameters which may
+# be unfrozen on top of LoRA depending on the ``--unfreeze_mode`` (A/B/B+).
+# Anything matching one of these substrings is included in the saved
+# checkpoint so that B/B+ runs round-trip the heads they actually trained.
+_HEAD_KEY_SUBSTRINGS = (
+    "text_hidden_fcs",
+    "visual_model.mask_decoder",
+    "lm_head",
+    "embed_tokens",
+)
+
+
+def unfreeze_seg_heads(model: nn.Module, mode: str) -> int:
+    """Selectively unfreeze segmentation-related parameters after ``inject_lora``.
+
+    Modes:
+      A  : no-op — LoRA-only training (current LISA-3D default).
+      B  : also train ``text_hidden_fcs`` (SEG→SAM-prompt projector) and
+           the SAM ``visual_model.mask_decoder``.  Mirrors the trainable set
+           of LISA's original ``train_ds.py`` minus the LLM head.
+      B+ : everything in B plus ``lm_head`` and ``embed_tokens`` (the latter
+           includes the ``[SEG]`` token row), giving the LLM output layers
+           room to adapt to the GraspClutter6D domain.
+
+    Returns the number of parameters whose ``requires_grad`` flipped to True.
+    """
+    mode = (mode or "A").strip()
+    if mode == "A":
+        return 0
+    if mode == "B":
+        keys = ("text_hidden_fcs", "visual_model.mask_decoder")
+    elif mode in ("B+", "Bplus", "bplus"):
+        keys = (
+            "text_hidden_fcs",
+            "visual_model.mask_decoder",
+            "lm_head",
+            "embed_tokens",
+        )
+    else:
+        raise ValueError(f"unfreeze_seg_heads: unknown mode {mode!r}")
+
+    n_params = 0
+    n_modules = 0
+    for name, p in model.named_parameters():
+        if any(k in name for k in keys):
+            if not p.requires_grad:
+                n_modules += 1
+            p.requires_grad = True
+            n_params += p.numel()
+    print(
+        f"[unfreeze_seg_heads] mode={mode} | newly-trainable tensors={n_modules} "
+        f"| extra trainable params={n_params:,}"
+    )
+    return n_modules
+
+
 def get_lora_state_dict(model: nn.Module) -> dict:
-    """Extract only LoRA parameters (lora_A / lora_B weights)."""
+    """Extract checkpoint payload — LoRA weights plus any unfrozen heads.
+
+    The selection mirrors the union of ``inject_lora`` adapters and
+    :func:`unfreeze_seg_heads` targets, so a Path-A run stores only
+    ``lora_A``/``lora_B`` while B / B+ runs additionally persist the heads
+    they actually trained.
+    """
+    keys = ("lora_A", "lora_B") + _HEAD_KEY_SUBSTRINGS
     return {
         name: param
         for name, param in model.state_dict().items()
-        if "lora_A" in name or "lora_B" in name
+        if any(k in name for k in keys)
     }
 
 
 def load_lora_weights(model: nn.Module, path: str) -> None:
-    """Load saved LoRA state dict back into the model (non-strict)."""
+    """Load saved LISA-3D checkpoint back into the model (non-strict).
+
+    Handles A / B / B+ checkpoints uniformly because the dict produced by
+    :func:`get_lora_state_dict` is a strict superset of LoRA keys.
+    """
     ckpt = torch.load(path, map_location="cpu")
     lora_sd = ckpt.get("lora_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(lora_sd, strict=False)
-    # Only LoRA keys should be loaded; base model keys are expected as missing
-    lora_missing = [k for k in missing if "lora_" in k]
-    if lora_missing:
-        print(f"[load_lora_weights] WARNING: missing LoRA keys: {lora_missing}")
+    # Base-model keys (everything outside LoRA + heads) are expected as missing.
+    expected_subs = ("lora_A", "lora_B") + _HEAD_KEY_SUBSTRINGS
+    suspect_missing = [k for k in missing if any(s in k for s in expected_subs)]
+    if suspect_missing:
+        print(f"[load_lora_weights] WARNING: missing trained keys: {suspect_missing[:10]}"
+              + (" …" if len(suspect_missing) > 10 else ""))
     if unexpected:
-        print(f"[load_lora_weights] WARNING: unexpected keys: {unexpected}")
-    print(f"[load_lora_weights] Loaded LoRA weights from {path}")
+        print(f"[load_lora_weights] WARNING: unexpected keys: {unexpected[:10]}"
+              + (" …" if len(unexpected) > 10 else ""))
+    print(f"[load_lora_weights] Loaded weights from {path} "
+          f"({len(lora_sd)} tensors)")
 
 
 # ── Loss helpers ──────────────────────────────────────────────────────────
@@ -336,21 +407,27 @@ class LISA3DForCausalLM(LISAForCausalLM):
             P_b_i = pred_b[i][0].sigmoid()   # (H, W)
             H, W = P_a_i.shape
 
-            # Camera params for this batch item
-            K_a_i = K_a[i:i+1]   # (1, 3, 3)
-            E_a_i = E_a[i:i+1]
-            K_b_i = K_b[i:i+1]
-            E_b_i = E_b[i:i+1]
-            d_a_i = depth_a[i:i+1]   # (1, H_orig, W_orig)
-            d_b_i = depth_b[i:i+1]
+            # All warp_mask inputs must share a single dtype — keep everything
+            # in the prediction mask's dtype (bf16 under bf16 training).
+            target_dtype = P_a_i.dtype
+            device = images_a.device
 
-            # Resize depth to match mask resolution if needed
+            # Camera params for this batch item
+            K_a_i = K_a[i:i+1].to(device=device, dtype=target_dtype)
+            E_a_i = E_a[i:i+1].to(device=device, dtype=target_dtype)
+            K_b_i = K_b[i:i+1].to(device=device, dtype=target_dtype)
+            E_b_i = E_b[i:i+1].to(device=device, dtype=target_dtype)
+            d_a_i = depth_a[i:i+1].to(device=device, dtype=target_dtype)
+            d_b_i = depth_b[i:i+1].to(device=device, dtype=target_dtype)
+
+            # Resize depth to match mask resolution if needed (rare; usually
+            # the SAM postprocess output already matches the depth shape).
             if d_a_i.shape[-2:] != (H, W):
                 d_a_i = F.interpolate(
-                    d_a_i.unsqueeze(1).float(), size=(H, W), mode="nearest"
+                    d_a_i.unsqueeze(1), size=(H, W), mode="nearest",
                 ).squeeze(1)
                 d_b_i = F.interpolate(
-                    d_b_i.unsqueeze(1).float(), size=(H, W), mode="nearest"
+                    d_b_i.unsqueeze(1), size=(H, W), mode="nearest",
                 ).squeeze(1)
 
             P_a_batch = P_a_i.unsqueeze(0)  # (1, H, W)
@@ -358,21 +435,11 @@ class LISA3DForCausalLM(LISAForCausalLM):
 
             # Warp and stop-gradient
             P_tilde_a2b = warp_mask(
-                P_a_batch,
-                d_a_i.to(images_a.device),
-                K_a_i.to(images_a.device),
-                E_a_i.to(images_a.device),
-                K_b_i.to(images_a.device),
-                E_b_i.to(images_a.device),
+                P_a_batch, d_a_i, K_a_i, E_a_i, K_b_i, E_b_i,
             ).detach()  # stop-gradient on warped target
 
             P_tilde_b2a = warp_mask(
-                P_b_batch,
-                d_b_i.to(images_a.device),
-                K_b_i.to(images_a.device),
-                E_b_i.to(images_a.device),
-                K_a_i.to(images_a.device),
-                E_a_i.to(images_a.device),
+                P_b_batch, d_b_i, K_b_i, E_b_i, K_a_i, E_a_i,
             ).detach()
 
             geo_loss = geo_loss + _geo_consistency_loss(

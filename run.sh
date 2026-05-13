@@ -1,46 +1,37 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────────────────
-# LISA-3D: Language-grounded 3D segmentation inference on GraspClutter6D
+# LISA-3D: per-Object-Name segmentation inference on GraspClutter6D.
 #
-# Runs LISA++ (with optional geometry-aware LoRA weights) on a set of scenes,
-# back-projects predicted masks into camera-frame 3D point clouds, and saves
-# predictions/{scene_id}/seg_3d.npz for evaluation with the Clutt3R-Seg
-# evaluation protocol.
+# For every Object Name in the CSV (or the subset passed via --target_names),
+# queries LISA++ with "Please segment the {name} in this image.", lifts the
+# resulting mask to 3D via depth back-projection, and writes
+# predictions/{scene_id}/seg_3d.npz for evaluation with
+# graspclutter6dAPI/utils/eval_seg_3d_iou.py.  The matching
+# {output_dir}/objects.json is written alongside.
 #
 # Usage:
-#   ./run.sh --vision_pretrained /path/to/sam_vit_h.pth [options]
+#   ./run.sh --vision_pretrained /path/to/sam_vit_h.pth                # base LISA++
 #
-# Examples:
-#   # Base LISA++ (no LoRA) on all test scenes, label all foreground as obj_id=1:
-#   ./run.sh --vision_pretrained /path/to/sam_vit_h.pth
-#
-#   # With trained LoRA weights on specific scenes:
 #   ./run.sh \
 #       --vision_pretrained /path/to/sam_vit_h.pth \
-#       --lora_weights runs/lisa3d/lora_final.pth \
-#       --scene_ids 2 3 6 7 8
+#       --lora_weights runs/lisa3d_B/lora_B_final.pth                  # trained run
 #
-#   # Category-specific query with correct obj_id label:
 #   ./run.sh \
 #       --vision_pretrained /path/to/sam_vit_h.pth \
-#       --lora_weights runs/lisa3d/lora_final.pth \
-#       --prompt "Segment the blue cylindrical container." \
-#       --label 66 \
-#       --scene_ids 2 3 6
+#       --lora_weights runs/lisa3d_B/lora_B_final.pth \
+#       --scene_ids 2 3 6 7 --target_names "banana,apple"              # subset
 #
-#   # Save mask overlays and RGBA prompt images:
 #   ./run.sh \
 #       --vision_pretrained /path/to/sam_vit_h.pth \
-#       --lora_weights runs/lisa3d/lora_final.pth \
-#       --vis_save_path ./vis_output \
-#       --vis_ply
+#       --lora_weights runs/lisa3d_B/lora_B_final.pth \
+#       --vis_save_path ./vis_output --vis_ply                         # visualise
 #
 # Evaluation (after running inference):
-#   python ../graspclutter6dAPI/utils/eval_seg_3d_iou.py \
-#       --gc6d_root /home/jhwang/grasp/GraspClutter6D \
+#   python /home/jhwang/grasp/graspclutter6dAPI/utils/eval_seg_3d_iou.py \
+#       --gc6d_root /home/jhwang/grasp/graspclutter6dAPI/GraspClutter6D \
 #       --pred_dir ./predictions \
 #       --camera realsense-d415 \
-#       --category_file /path/to/categories.json
+#       --category_file ./predictions/objects.json
 # ──────────────────────────────────────────────────────────────────────────────
 set -e
 
@@ -48,7 +39,8 @@ set -e
 VERSION="Senqiao/LISA_Plus_7b"
 VISION_PRETRAINED=""
 LORA_WEIGHTS=""
-DATA_ROOT="/home/jhwang/grasp/GraspClutter6D"
+DATA_ROOT="/home/jhwang/grasp/graspclutter6dAPI/GraspClutter6D"
+CSV_PATH="/home/jhwang/grasp/graspclutter6dAPI/GraspClutter6D/graspclutter6d_object_id.csv"
 OUTPUT_DIR="./predictions"
 VIS_SAVE_PATH=""
 GPU="0"
@@ -56,8 +48,7 @@ PRECISION="bf16"
 N_VIEWS="8"
 CAMERA="realsense-d415"
 SCENE_IDS=""
-LABEL="1"
-PROMPT="Please segment all objects in this image."
+TARGET_NAMES=""
 VISION_TOWER="openai/clip-vit-large-patch14"
 MAX_NEW_TOKENS="32"
 VIS_PLY="false"
@@ -69,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --vision_pretrained) VISION_PRETRAINED="$2"; shift 2 ;;
         --lora_weights)      LORA_WEIGHTS="$2";      shift 2 ;;
         --data_root)         DATA_ROOT="$2";         shift 2 ;;
+        --csv_path)          CSV_PATH="$2";          shift 2 ;;
         --output_dir)        OUTPUT_DIR="$2";        shift 2 ;;
         --vis_save_path)     VIS_SAVE_PATH="$2";     shift 2 ;;
         --gpu)               GPU="$2";               shift 2 ;;
@@ -76,15 +68,13 @@ while [[ $# -gt 0 ]]; do
         --n_views)           N_VIEWS="$2";           shift 2 ;;
         --camera)            CAMERA="$2";            shift 2 ;;
         --scene_ids)
-            # Collect all following non-flag arguments as scene IDs
             shift
             while [[ $# -gt 0 && "$1" != --* ]]; do
                 SCENE_IDS="$SCENE_IDS $1"
                 shift
             done
             ;;
-        --label)             LABEL="$2";             shift 2 ;;
-        --prompt)            PROMPT="$2";            shift 2 ;;
+        --target_names)      TARGET_NAMES="$2";      shift 2 ;;
         --vision_tower)      VISION_TOWER="$2";      shift 2 ;;
         --max_new_tokens)    MAX_NEW_TOKENS="$2";    shift 2 ;;
         --vis_ply)           VIS_PLY="true";         shift ;;
@@ -103,6 +93,11 @@ fi
 
 if [[ ! -f "$VISION_PRETRAINED" ]]; then
     echo "ERROR: SAM checkpoint not found at: $VISION_PRETRAINED"
+    exit 1
+fi
+
+if [[ ! -f "$CSV_PATH" ]]; then
+    echo "ERROR: Object-name CSV not found at: $CSV_PATH"
     exit 1
 fi
 
@@ -131,24 +126,25 @@ EXTRA_ARGS=""
 [[ -n "$LORA_WEIGHTS"  ]] && EXTRA_ARGS="$EXTRA_ARGS --lora_weights $LORA_WEIGHTS"
 [[ -n "$VIS_SAVE_PATH" ]] && EXTRA_ARGS="$EXTRA_ARGS --vis_save_path $VIS_SAVE_PATH"
 [[ -n "$SCENE_IDS"     ]] && EXTRA_ARGS="$EXTRA_ARGS --scene_ids $SCENE_IDS"
+[[ -n "$TARGET_NAMES"  ]] && EXTRA_ARGS="$EXTRA_ARGS --target_names $TARGET_NAMES"
 [[ "$VIS_PLY" == "true" ]] && EXTRA_ARGS="$EXTRA_ARGS --vis_ply"
 
 # ── Print configuration ───────────────────────────────────────────────────────
-echo "LISA-3D Inference"
+echo "LISA-3D Inference (per Object Name)"
 echo "─────────────────────────────────────────────────────────────────────"
 echo "Model version      : $VERSION"
 echo "SAM checkpoint     : $VISION_PRETRAINED"
 echo "LoRA weights       : ${LORA_WEIGHTS:-none (base LISA++)}"
 echo "Data root          : $DATA_ROOT"
+echo "Object-name CSV    : $CSV_PATH"
 echo "Output dir         : $OUTPUT_DIR"
 echo "Camera             : $CAMERA"
 echo "Views per scene    : $N_VIEWS"
-echo "Prompt             : $PROMPT"
-echo "Label (obj_id)     : $LABEL"
 echo "GPU                : $GPU"
 echo "Precision          : $PRECISION"
 [[ -n "$VIS_SAVE_PATH" ]] && echo "Visualisation dir  : $VIS_SAVE_PATH"
 [[ -n "$SCENE_IDS"     ]] && echo "Scene IDs          : $SCENE_IDS"
+[[ -n "$TARGET_NAMES"  ]] && echo "Target names       : $TARGET_NAMES"
 echo "─────────────────────────────────────────────────────────────────────"
 
 # ── Run inference ─────────────────────────────────────────────────────────────
@@ -156,12 +152,11 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" "${SCRIPT_DIR}/infer.py" \
     --version           "$VERSION" \
     --vision_pretrained "$VISION_PRETRAINED" \
     --data_root         "$DATA_ROOT" \
+    --csv_path          "$CSV_PATH" \
     --output_dir        "$OUTPUT_DIR" \
     --precision         "$PRECISION" \
     --n_views           "$N_VIEWS" \
     --camera            "$CAMERA" \
-    --prompt            "$PROMPT" \
-    --label             "$LABEL" \
     --vision_tower      "$VISION_TOWER" \
     --max_new_tokens    "$MAX_NEW_TOKENS" \
     $EXTRA_ARGS

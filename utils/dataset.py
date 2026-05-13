@@ -2,13 +2,14 @@
 GraspClutter6D datasets for LISA-3D training and inference.
 
 Training  — GraspClutter6DPairDataset:
-  Returns two views of the same scene with a shared text query and their
-  ground-truth foreground masks (union of all visible objects), depth maps,
-  and camera parameters for the geometry-consistency loss.
+  Returns two views of the same scene with a per-Object-Name text query and
+  the corresponding per-name mask_visib (OR across all obj_ids sharing that
+  name), depth maps, and camera parameters for the geometry-consistency loss.
 
 Inference — GraspClutter6DInferDataset:
   Returns individual frames chosen to match the Clutt3R-Seg evaluation
-  protocol (8 equally-spaced views, realsense-d415 by default).
+  protocol (8 equally-spaced views, realsense-d415 by default).  The prompt
+  is supplied by the caller at infer time (one prompt per Object Name).
 
 Frame-ID convention in GraspClutter6D
   img_id = ann_id * 4 + cam_offset   (ann_ids 0–12, 13 annotation positions)
@@ -20,7 +21,7 @@ Frame-ID convention in GraspClutter6D
 import json
 import os
 import random
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -50,8 +51,8 @@ from utils.utils import (
     preprocess_sam,
 )
 
-# Default text prompt for training (class-agnostic foreground segmentation)
-_TRAIN_PROMPT = "Please segment all objects in this image."
+# Per-object training prompt template; {name} = Object Name from the CSV.
+_TRAIN_PROMPT_OBJ = "Please segment the {name} in this image."
 # Answer template (must contain [SEG] so the model outputs the seg token)
 _TRAIN_ANSWER = "Sure, [SEG]."
 
@@ -94,27 +95,27 @@ def _valid_img_ids(scene_gt: dict, cam_offset: int) -> List[int]:
     return sorted(ids)
 
 
-def _build_combined_mask(
+def _frame_resolution(scene_dir: str, img_id: int) -> Tuple[int, int]:
+    """Resolve (H, W) for a frame without holding the RGB array in memory."""
+    rgb_path = os.path.join(scene_dir, "rgb", f"{img_id:06d}.png")
+    rgb = cv2.imread(rgb_path)
+    return (rgb.shape[:2] if rgb is not None else (1080, 1920))
+
+
+def _build_object_mask(
     scene_dir: str,
     img_id: int,
     scene_gt: dict,
-    min_visib_fract: float = 0.0,
-    min_px_visib: int = 0,
+    target_obj_ids: set,
     scene_gt_info: Optional[dict] = None,
-) -> np.ndarray:
-    """Build binary foreground mask = union of all visible object masks.
+    min_visib_fract: float = 0.1,
+    min_px_visib: int = 200,
+) -> Optional[np.ndarray]:
+    """Per-name foreground mask = OR over visible mask_visib of every object
+    in this frame whose ``obj_id`` is in ``target_obj_ids``.
 
-    Args:
-        scene_dir:       Path to the scene directory.
-        img_id:          Integer image ID.
-        scene_gt:        Parsed scene_gt.json.
-        min_visib_fract: Minimum visibility fraction to include an object.
-        min_px_visib:    Minimum visible pixel count.
-        scene_gt_info:   Parsed scene_gt_info.json (optional, for filtering).
-
-    Returns:
-        (H, W) uint8 binary mask (0 or 255 matching OpenCV convention, then
-        returned as bool numpy array).
+    Returns ``None`` if no instance of the target name passes the visibility
+    filter (caller skips the anchor).
     """
     key = str(img_id)
     objs = scene_gt.get(key, [])
@@ -124,6 +125,8 @@ def _build_combined_mask(
     combined: Optional[np.ndarray] = None
 
     for obj_idx, obj in enumerate(objs):
+        if obj.get("obj_id") not in target_obj_ids:
+            continue
         # Visibility filter
         if gt_info and obj_idx < len(gt_info):
             vf = gt_info[obj_idx].get("visib_fract", 1.0)
@@ -136,7 +139,6 @@ def _build_combined_mask(
         )
         if not os.path.exists(mask_path):
             continue
-
         m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if m is None:
             continue
@@ -147,13 +149,33 @@ def _build_combined_mask(
             combined = combined | (m > 0)
 
     if combined is None:
-        # Fallback: return empty mask using RGB image shape
-        rgb_path = os.path.join(scene_dir, "rgb", f"{img_id:06d}.png")
-        rgb = cv2.imread(rgb_path)
-        H, W = (rgb.shape[:2] if rgb is not None else (1080, 1920))
-        combined = np.zeros((H, W), dtype=bool)
-
+        return None
     return combined.astype(bool)
+
+
+def _frame_object_ids(
+    scene_gt: dict,
+    img_id: int,
+    scene_gt_info: Optional[dict],
+    min_visib_fract: float,
+    min_px_visib: int,
+) -> List[int]:
+    """Return list of obj_ids appearing in this frame that pass the
+    visibility threshold (de-duplicated)."""
+    key = str(img_id)
+    objs = scene_gt.get(key, [])
+    gt_info = (scene_gt_info or {}).get(key, [])
+    seen = set()
+    for obj_idx, obj in enumerate(objs):
+        if gt_info and obj_idx < len(gt_info):
+            vf = gt_info[obj_idx].get("visib_fract", 1.0)
+            px = gt_info[obj_idx].get("px_count_visib", 999)
+            if vf < min_visib_fract or px < min_px_visib:
+                continue
+        oid = obj.get("obj_id")
+        if oid is not None:
+            seen.add(int(oid))
+    return sorted(seen)
 
 
 def _load_frame(
@@ -245,12 +267,19 @@ def _build_conversation(
 class GraspClutter6DPairDataset(Dataset):
     """Multi-view pair dataset for geometry-aware LoRA training.
 
-    Each item returns two views (A, B) from the same scene with:
+    Each item is anchored on ``(scene_id, img_id_a, object_name)`` — a single
+    Object Name from ``graspclutter6d_object_id.csv``.  The second view
+    ``img_id_b`` is sampled at runtime from the same scene's frames where
+    the same Object Name still passes the visibility filter, so the
+    per-object mask is non-empty in both views.
+
+    Returned tensors per view:
       - Preprocessed RGB images (SAM + CLIP formats)
-      - Combined foreground masks (union of all visible objects)
-      - Depth maps in mm
+      - Per-name visibility mask  (OR over all obj_ids that share the name
+        and pass the visibility threshold in that frame)
+      - Depth map in mm
       - Camera intrinsics K and extrinsics E (w2c, t in metres)
-      - Tokenised shared text query
+      - Tokenised ``"Please segment the {name} in this image."`` query
 
     The training loss is:
       L_total = L_seg_a + L_seg_b + lambda * L_geo
@@ -262,12 +291,13 @@ class GraspClutter6DPairDataset(Dataset):
         tokenizer,
         clip_image_processor: CLIPImageProcessor,
         scene_ids: List[int],
+        name_to_obj_ids: Dict[str, List[int]],
         image_size: int = 1024,
         conv_type: str = "llava_v1",
         camera: str = "realsense-d415",
         min_visib_fract: float = 0.1,
         min_px_visib: int = 200,
-        prompt: str = _TRAIN_PROMPT,
+        target_names: Optional[List[str]] = None,
         answer: str = _TRAIN_ANSWER,
     ):
         self.data_root          = data_root
@@ -280,14 +310,31 @@ class GraspClutter6DPairDataset(Dataset):
         self.depth_scale        = CAM_DEPTH_SCALES[camera]
         self.min_visib_fract    = min_visib_fract
         self.min_px_visib       = min_px_visib
-        self.prompt             = prompt
         self.answer             = answer
         self.sam_transform      = ResizeLongestSide(image_size)
 
-        # Build index: list of (scene_id, img_id) for frames with ≥1 visible obj
-        self._items: List[Tuple[int, int]] = []
-        # Map from scene_id → list of valid img_ids (for pair sampling)
-        self._scene_to_ids: dict = {}
+        # Restrict to the requested object names (if any).
+        if target_names is not None:
+            target_set = set(target_names)
+            self.name_to_obj_ids: Dict[str, List[int]] = {
+                n: list(ids) for n, ids in name_to_obj_ids.items()
+                if n in target_set
+            }
+        else:
+            self.name_to_obj_ids = {
+                n: list(ids) for n, ids in name_to_obj_ids.items()
+            }
+        # Reverse map: obj_id -> name for the active (filtered) set.
+        self.obj_id_to_name: Dict[int, str] = {}
+        for name, ids in self.name_to_obj_ids.items():
+            for oid in ids:
+                self.obj_id_to_name[int(oid)] = name
+
+        # Anchor items: each entry = (scene_id, img_id_a, object_name).
+        self._items: List[Tuple[int, int, str]] = []
+        # scene_id -> {object_name -> sorted list of img_ids where that name
+        # has a non-empty per-name mask}.  Used to pick paired view B.
+        self._scene_name_to_imgs: Dict[int, Dict[str, List[int]]] = {}
         self._build_index(scene_ids)
 
     def _build_index(self, scene_ids: List[int]) -> None:
@@ -295,57 +342,81 @@ class GraspClutter6DPairDataset(Dataset):
             scene_dir = os.path.join(self.data_root, "scenes", f"{scene_id:06d}")
             if not os.path.isdir(scene_dir):
                 continue
-            scene_gt   = _load_scene_gt(scene_dir)
-            scene_cam  = _load_scene_camera(scene_dir)
-            gt_info    = _load_scene_gt_info(scene_dir)
-            img_ids    = _valid_img_ids(scene_gt, self.cam_offset)
+            scene_gt  = _load_scene_gt(scene_dir)
+            scene_cam = _load_scene_camera(scene_dir)
+            gt_info   = _load_scene_gt_info(scene_dir)
+            img_ids   = _valid_img_ids(scene_gt, self.cam_offset)
 
-            valid_ids = []
+            # name -> list of img_ids in this scene where the name has at
+            # least one visible-enough instance.
+            name_to_imgs: Dict[str, List[int]] = {}
             for img_id in img_ids:
-                key = str(img_id)
-                if key not in scene_cam:
+                if str(img_id) not in scene_cam:
                     continue
-                # Check at least one object passes visibility threshold
-                objs    = scene_gt.get(key, [])
-                gi      = gt_info.get(key, [])
-                has_obj = False
-                for j, obj in enumerate(objs):
-                    vf = gi[j].get("visib_fract", 1.0) if j < len(gi) else 1.0
-                    px = gi[j].get("px_count_visib", 999) if j < len(gi) else 999
-                    if vf >= self.min_visib_fract and px >= self.min_px_visib:
-                        has_obj = True
-                        break
-                if has_obj:
-                    valid_ids.append(img_id)
+                # Which obj_ids are visible enough in this frame?
+                visible_oids = _frame_object_ids(
+                    scene_gt, img_id, gt_info,
+                    self.min_visib_fract, self.min_px_visib,
+                )
+                if not visible_oids:
+                    continue
+                # Which active object names get a non-empty mask here?
+                names_here: set = set()
+                for oid in visible_oids:
+                    name = self.obj_id_to_name.get(int(oid))
+                    if name is not None:
+                        names_here.add(name)
+                for name in names_here:
+                    name_to_imgs.setdefault(name, []).append(img_id)
 
-            if len(valid_ids) >= 2:
-                self._scene_to_ids[scene_id] = valid_ids
-                for img_id in valid_ids:
-                    self._items.append((scene_id, img_id))
+            if not name_to_imgs:
+                continue
+
+            # Keep only (name) with >=2 frames so view B can differ from A.
+            paired_name_to_imgs = {
+                n: sorted(ids) for n, ids in name_to_imgs.items()
+                if len(ids) >= 2
+            }
+            if not paired_name_to_imgs:
+                continue
+            self._scene_name_to_imgs[scene_id] = paired_name_to_imgs
+            for name, ids in paired_name_to_imgs.items():
+                for img_id in ids:
+                    self._items.append((scene_id, img_id, name))
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __getitem__(self, idx: int) -> dict:
-        scene_id, img_id_a = self._items[idx]
+        scene_id, img_id_a, name = self._items[idx]
         scene_dir = os.path.join(self.data_root, "scenes", f"{scene_id:06d}")
 
-        # Sample a different frame from the same scene as view B
-        other_ids = [i for i in self._scene_to_ids[scene_id] if i != img_id_a]
-        img_id_b  = random.choice(other_ids)
+        # Pick a paired frame where the same Object Name is still visible.
+        candidates = [
+            i for i in self._scene_name_to_imgs[scene_id][name] if i != img_id_a
+        ]
+        img_id_b = random.choice(candidates) if candidates else img_id_a
 
         scene_gt      = _load_scene_gt(scene_dir)
         scene_camera  = _load_scene_camera(scene_dir)
         gt_info       = _load_scene_gt_info(scene_dir)
 
+        target_obj_ids = set(int(o) for o in self.name_to_obj_ids[name])
+
         def load_and_preprocess(img_id: int):
             rgb, depth, K, E = _load_frame(
                 scene_dir, img_id, scene_camera, self.depth_scale
             )
-            mask = _build_combined_mask(
+            mask = _build_object_mask(
                 scene_dir, img_id, scene_gt,
-                self.min_visib_fract, self.min_px_visib, gt_info
+                target_obj_ids,
+                gt_info,
+                self.min_visib_fract, self.min_px_visib,
             )
+            if mask is None:
+                # Should not happen because _build_index gated on visibility,
+                # but guard anyway.
+                mask = np.zeros(rgb.shape[:2], dtype=bool)
             original_size = rgb.shape[:2]   # (H, W)
 
             # CLIP preprocessing
@@ -382,8 +453,9 @@ class GraspClutter6DPairDataset(Dataset):
         fb = load_and_preprocess(img_id_b)
 
         # Tokenise shared text (same query for both views)
+        prompt = _TRAIN_PROMPT_OBJ.format(name=name)
         input_ids, labels, attention_mask = _build_conversation(
-            self.prompt, self.answer, self.tokenizer, self.conv_type
+            prompt, self.answer, self.tokenizer, self.conv_type
         )
 
         return {
@@ -409,6 +481,11 @@ class GraspClutter6DPairDataset(Dataset):
             "input_ids":      input_ids,
             "labels":         labels,
             "attention_mask": attention_mask,
+            # For diagnostics / sanity checks (not used by collate).
+            "object_name":    name,
+            "scene_id":       scene_id,
+            "img_id_a":       img_id_a,
+            "img_id_b":       img_id_b,
         }
 
 
@@ -554,8 +631,12 @@ def collate_fn_train(batch: List[dict]) -> dict:
     masks_list_a = [b["masks_a"].unsqueeze(0) for b in batch]
     masks_list_b = [b["masks_b"].unsqueeze(0) for b in batch]
 
-    label_list_a = [torch.tensor(b["original_size_a"], dtype=torch.long) for b in batch]
-    label_list_b = [torch.tensor(b["original_size_b"], dtype=torch.long) for b in batch]
+    # LISA's model_forward reads ``label_list[i].shape`` (a Tuple[H, W]) and
+    # passes it to SAM's postprocess_masks as the resize target.  We therefore
+    # need a tensor whose shape *is* (H, W), not a length-2 vector.  Reusing
+    # the GT mask is cheap and conveys the right shape.
+    label_list_a = [b["masks_a"] for b in batch]
+    label_list_b = [b["masks_b"] for b in batch]
 
     resize_list_a = [b["resize_list_a"] for b in batch]
     resize_list_b = [b["resize_list_b"] for b in batch]
