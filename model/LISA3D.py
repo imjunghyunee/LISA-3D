@@ -229,35 +229,6 @@ def load_lora_weights(model: nn.Module, path: str) -> None:
 
 # ── Loss helpers ──────────────────────────────────────────────────────────
 
-def _bce_dice_loss(
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    bce_weight: float = 2.0,
-    dice_weight: float = 0.5,
-) -> torch.Tensor:
-    """BCE + Dice segmentation loss over a list of (N_i, H, W) tensors."""
-    total_loss = torch.tensor(0.0, device=pred_masks[0].device, dtype=pred_masks[0].dtype)
-    n_total = 0
-    for pred, gt in zip(pred_masks, gt_masks):
-        n = gt.shape[0]
-        if n == 0:
-            continue
-
-        # BCE
-        bce = F.binary_cross_entropy_with_logits(pred, gt, reduction="none")
-        bce = bce.flatten(1).mean(1).sum()
-
-        # Dice
-        p = pred.sigmoid().flatten(1)
-        g = gt.flatten(1)
-        dice = 1.0 - (2.0 * (p * g).sum(1) + 1.0) / (p.sum(1) + g.sum(1) + 1.0)
-        dice = dice.sum()
-
-        total_loss = total_loss + bce_weight * bce + dice_weight * dice
-        n_total += n
-
-    return total_loss / max(n_total, 1)
-
 
 def _geo_consistency_loss(
     P_a: torch.Tensor,
@@ -358,38 +329,39 @@ class LISA3DForCausalLM(LISAForCausalLM):
         )
 
         # ── Segmentation losses ───────────────────────────────────────────
-        # model_forward already returns combined ce + bce + dice loss.
-        seg_loss_a = out_a["loss"]
-        seg_loss_b = out_b["loss"]
+        # Paper eq.(5): L_seg = BCE + Dice only; mask_loss excludes CE.
+        seg_loss_a = out_a["mask_loss"]
+        seg_loss_b = out_b["mask_loss"]
 
         # ── Geometric consistency loss ────────────────────────────────────
-        # We need per-image sigmoid probabilities at the original resolution.
-        # Re-run a minimal inference-mode pass to extract raw logit maps.
-        with torch.no_grad():
-            inf_a = self.model_forward(
-                images=images_a,
-                images_clip=images_clip_a,
-                input_ids=input_ids,
-                labels=labels,
-                attention_masks=attention_masks,
-                offset=offset,
-                masks_list=masks_list_a,
-                label_list=label_list_a,
-                resize_list=resize_list_a,
-                inference=True,
-            )
-            inf_b = self.model_forward(
-                images=images_b,
-                images_clip=images_clip_b,
-                input_ids=input_ids,
-                labels=labels,
-                attention_masks=attention_masks,
-                offset=offset,
-                masks_list=masks_list_b,
-                label_list=label_list_b,
-                resize_list=resize_list_b,
-                inference=True,
-            )
+        # Inference-mode passes to extract per-pixel probability maps.
+        # Gradient tracking must be ON here so that L_geo (eq.6) flows
+        # gradients back through P_a and P_b.  stopgrad is applied only to
+        # the warped targets P̃ below (via .detach()), matching the paper.
+        inf_a = self.model_forward(
+            images=images_a,
+            images_clip=images_clip_a,
+            input_ids=input_ids,
+            labels=labels,
+            attention_masks=attention_masks,
+            offset=offset,
+            masks_list=masks_list_a,
+            label_list=label_list_a,
+            resize_list=resize_list_a,
+            inference=True,
+        )
+        inf_b = self.model_forward(
+            images=images_b,
+            images_clip=images_clip_b,
+            input_ids=input_ids,
+            labels=labels,
+            attention_masks=attention_masks,
+            offset=offset,
+            masks_list=masks_list_b,
+            label_list=label_list_b,
+            resize_list=resize_list_b,
+            inference=True,
+        )
 
         # pred_masks: list of (N_seg, H, W) per batch item; take first seg token
         pred_a = inf_a["pred_masks"]   # list[(N_seg, H, W)]
